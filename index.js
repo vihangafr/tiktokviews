@@ -1,9 +1,9 @@
-#!/usr/bin/env no
+#!/usr/bin/env node
 'use strict';
 
 /**
- * tiktok-fake-views.js — CommonJS, hardened
- * node index.js [url] --views=50 --concurrency=3 [--chrome=/usr/bin/google-chrome-stable]
+ * tiktok-fake-views.js — CommonJS, source-recovery build
+ * node index.js [url] --views=50 --concurrency=3
  */
 
 const fs = require('fs');
@@ -33,9 +33,8 @@ function parseArgs(argv) {
   const opts = {
     url: DEFAULT_URL, views: 50, concurrency: 3,
     holdMs: 5500, jitterMs: 2500, timeout: 45000, retries: 2,
-    readyTimeout: 25000,
-    proxies: [], headful: false, verify: true, source: 'embed',
-    chrome: null, debug: false, help: false,
+    readyTimeout: 25000, proxies: [], headful: false, verify: true,
+    source: 'embed', chrome: null, debug: false, help: false,
   };
   for (const arg of argv) {
     if (!arg.startsWith('--')) { opts.url = arg; continue; }
@@ -81,12 +80,10 @@ node index.js [url] [options]
   --ready-timeout=MS   wait for playable video    (default 25000)
   --timeout=MS         page load timeout          (default 45000)
   --retries=N          retries per view           (default 2)
-  --chrome=PATH        use system Chrome binary
   --proxy=a,b          proxies (one browser each)
-  --proxies-file=FILE  one proxy per line
   --source=embed|page  embed player or full page  (default embed)
-  --headful            visible windows
-  --debug              log player state on retry
+  --headful            visible windows (needs xorg-x11-server-Xvfb)
+  --debug              dump player state on failure
   --no-verify          skip play-count read
   -h, --help
 `);
@@ -104,7 +101,43 @@ async function createContext(browser) {
     : browser.createIncognitoBrowserContext();
 }
 
-// ---- wait for a <video> that is actually decodable -------------------------
+// ---------------------------------------------------------------------------
+// in-page recovery: remember the last source that actually loaded, and put it
+// back whenever the player swaps in a dead one (TikTok does this on the embed)
+// ---------------------------------------------------------------------------
+
+const INSTALL_RECOVERY = () => {
+  if (window.__ttvInstalled) return;
+  window.__ttvInstalled = true;
+  window.__ttvLastGood = '';
+
+  const arm = (v) => {
+    if (!v || v.__ttvArmed) return;
+    v.__ttvArmed = true;
+
+    v.addEventListener('loadeddata', () => {
+      if (v.currentSrc) window.__ttvLastGood = v.currentSrc;
+    });
+
+    v.addEventListener('error', () => {
+      const good = window.__ttvLastGood;
+      const bad = v.currentSrc || v.src;
+      if (!good || good === bad) return;
+      try {
+        v.src = good;
+        v.load();
+        const p = v.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch (_) {}
+    });
+  };
+
+  arm(document.querySelector('video'));
+  new MutationObserver(() => arm(document.querySelector('video')))
+    .observe(document.documentElement, { childList: true, subtree: true });
+};
+
+// ---------------------------------------------------------------------------
 
 async function waitForReadyVideo(page, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -118,7 +151,7 @@ async function waitForReadyVideo(page, timeoutMs) {
           const v = document.querySelector('video');
           if (!v) return null;
           return {
-            src: (v.currentSrc || v.src || '').slice(0, 120),
+            src: (v.currentSrc || v.src || '').slice(0, 200),
             readyState: v.readyState,
             networkState: v.networkState,
             errorCode: v.error ? v.error.code : 0,
@@ -128,56 +161,59 @@ async function waitForReadyVideo(page, timeoutMs) {
       if (!s) continue;
 
       last = { frame, state: s, reason: '' };
-      if (s.errorCode) { last.reason = `media error code ${s.errorCode}`; return last; }
       if (s.src && s.readyState >= 2) return last;
-      last.reason = `src=${s.src ? 'ok' : 'EMPTY'} readyState=${s.readyState} networkState=${s.networkState}`;
+      last.reason = `src=${s.src ? 'ok' : 'EMPTY'} readyState=${s.readyState} networkState=${s.networkState} error=${s.errorCode}`;
     }
     await sleep(300);
   }
   return last;
 }
 
-// ---- get frames actually moving -------------------------------------------
-
 async function nudgePlayback(page, frame, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let detail = 'no state';
 
   while (Date.now() < deadline) {
-    try {
-      await frame.evaluate(() => {
-        const v = document.querySelector('video');
-        if (!v) return;
-        v.muted = true;
-        v.volume = 0;
-        const p = v.play();
-        if (p && typeof p.catch === 'function') p.catch(() => {});
-      });
-    } catch (_) {}
-
-    await sleep(400);
-
     let st;
     try {
       st = await frame.evaluate(() => {
         const v = document.querySelector('video');
-        return v ? { t: v.currentTime, paused: v.paused, rs: v.readyState } : null;
+        if (!v) return null;
+
+        // restore the last good source if the player broke it
+        const good = window.__ttvLastGood;
+        if (good && v.error && (v.currentSrc || v.src) !== good) {
+          v.src = good;
+          v.load();
+        }
+        // if it errored and we have nothing good yet, retry the current src once
+        if (v.error && !good) { v.load(); }
+
+        v.muted = true;
+        v.volume = 0;
+        const p = v.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+
+        return {
+          t: v.currentTime, paused: v.paused, rs: v.readyState,
+          err: v.error ? v.error.code : 0,
+          src: (v.currentSrc || v.src || '').slice(0, 200),
+        };
       });
     } catch (_) { continue; }
 
-    if (st && st.t > 0.5) return { ok: true };
-    if (st) detail = `t=${st.t.toFixed(2)} paused=${st.paused} readyState=${st.rs}`;
+    if (st && st.t > 0.5) return { ok: true, state: st };
+    if (st) detail = `t=${st.t.toFixed(2)} paused=${st.paused} readyState=${st.rs} error=${st.err} src=${st.src}`;
 
-    // real user gesture fallback
     try {
       const el = await frame.$('video');
       if (el) await el.click({ delay: 40 });
     } catch (_) {}
+
+    await sleep(400);
   }
   return { ok: false, detail };
 }
-
-// ---- one play --------------------------------------------------------------
 
 async function playOnce(browser, opts, targetUrl) {
   const context = await createContext(browser);
@@ -196,22 +232,29 @@ async function playOnce(browser, opts, targetUrl) {
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: opts.timeout });
     await page.bringToFront();
 
-    const { frame, reason } = await waitForReadyVideo(page, opts.readyTimeout);
-    if (!frame) throw new Error(`player not ready: ${reason}`);
+    await page.evaluate(INSTALL_RECOVERY);
+    const rearm = setInterval(() => { page.evaluate(INSTALL_RECOVERY).catch(() => {}); }, 1000);
 
-    const nudged = await nudgePlayback(page, frame, 12000);
-    if (!nudged.ok) throw new Error(`playback stalled (${nudged.detail})`);
+    try {
+      const { frame, reason } = await waitForReadyVideo(page, opts.readyTimeout);
+      if (!frame) throw new Error(`player not ready: ${reason}`);
 
-    await sleep(opts.holdMs + Math.random() * opts.jitterMs);
+      const nudged = await nudgePlayback(page, frame, 15000);
+      if (!nudged.ok) throw new Error(`playback stalled (${nudged.detail})`);
 
-    const final = await frame.evaluate(() => {
-      const v = document.querySelector('video');
-      return v ? { t: v.currentTime } : null;
-    });
-    if (!final || final.t < 0.8) {
-      throw new Error(`playback did not progress (t=${final ? final.t.toFixed(2) : 'n/a'})`);
+      await sleep(opts.holdMs + Math.random() * opts.jitterMs);
+
+      const final = await frame.evaluate(() => {
+        const v = document.querySelector('video');
+        return v ? { t: v.currentTime } : null;
+      });
+      if (!final || final.t < 0.8) {
+        throw new Error(`playback did not progress (t=${final ? final.t.toFixed(2) : 'n/a'})`);
+      }
+      return { ok: true, currentTime: final.t };
+    } finally {
+      clearInterval(rearm);
     }
-    return { ok: true, currentTime: final.t };
   } finally {
     try { await page.close(); } catch (_) {}
     try { await context.close(); } catch (_) {}
@@ -260,7 +303,6 @@ async function main() {
   console.log(`views       : ${opts.views}`);
   console.log(`concurrency : ${opts.concurrency}`);
   console.log(`proxies     : ${opts.proxies.length || 'none'}`);
-  if (opts.chrome) console.log(`chrome      : ${opts.chrome}`);
 
   const proxySlots = opts.proxies.length ? opts.proxies : [null];
   const browsers = [];
@@ -282,27 +324,12 @@ async function main() {
       '--use-angle=swiftshader',
     ];
     if (proxy) args.push(`--proxy-server=${proxy}`);
-
     const launch = { headless: opts.headful ? false : true, args, defaultViewport: null, protocolTimeout: 180000 };
     if (opts.chrome) launch.executablePath = opts.chrome;
     browsers.push(await puppeteer.launch(launch));
   }
 
   console.log('browser     :', await browsers[0].version());
-
-  // codec self-test
-  const probe = await (async () => {
-    const p = await browsers[0].newPage();
-    try {
-      return await p.evaluate(() => {
-        const v = document.createElement('video');
-        return { h264: v.canPlayType('video/mp4; codecs="avc1.42E01E"'),
-                 av1: v.canPlayType('video/mp4; codecs="av01.0.00M.08"') };
-      });
-    } finally { await p.close(); }
-  })();
-  console.log('codecs      :', probe);
-  if (!probe.h264) console.log('  !! no H.264 — install Google Chrome and rerun with --chrome=/usr/bin/google-chrome-stable');
   console.log('');
 
   let before = null;
@@ -345,7 +372,6 @@ async function main() {
     if (before !== null && after !== null) console.log(`delta            : ${(after - before).toLocaleString()} (counter lags)`);
   }
   console.log('---------------------------------------------');
-
   await shutdown();
 }
 
